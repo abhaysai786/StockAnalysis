@@ -1,0 +1,116 @@
+#!/bin/bash
+#SBATCH --partition=debug
+#SBATCH --time=00:20:00
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --exclusive
+#SBATCH --job-name="WC_hive"
+#SBATCH --output=test-%J.out
+#SBATCH --mail-user=vishwass@buffalo.edu
+#SBATCH --mail-type=ALL
+#Specifies that the job will be requeued after a node failure.
+#The default is that the job will not be requeued.
+#
+#This SLURM script is modified version of the SDSC script
+# found in /util/academic/myhadoop/myHadoop-0.30b/examples.
+# CDC January 29, 2015
+#
+echo "SLURM_JOBID="$SLURM_JOBID
+echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
+echo "SLURM_NNODES"=$SLURM_NNODES
+echo "SLURMTMPDIR="$SLURMTMPDIR
+
+echo "working directory = "$SLURM_SUBMIT_DIR
+
+module load java/1.6.0_22
+module load hadoop/2.5.1
+module load hive/0.14.0
+module load myhadoop/0.30b
+module list
+echo "MH_HOME="$MH_HOME
+echo "HADOOP_HOME="$HADOOP_HOME
+echo "Setting HADOOP to use SLURMTMPDIR on the local disk"
+export MH_SCRATCH_DIR=$SLURMTMPDIR
+echo "MH_SCRATCH_DIR="$MH_SCRATCH_DIR
+#### Set this to the directory where Hadoop configs should be generated
+# Don't change the name of this variable (HADOOP_CONF_DIR) as it is
+# required by Hadoop - all config files will be picked up from here
+#
+# Make sure that this is accessible to all nodes
+export HADOOP_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+export HIVE_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+echo "create diretory for HIVE metadata"
+### Set up the configuration
+# Make sure number of nodes is the same as what you have requested from PBS
+# usage: $myhadoop-configure.sh -h
+# this is the non-persistent mode
+NPROCS=`srun --nodes=${SLURM_NNODES} bash -c 'hostname' |wc -l`
+echo "-------Set up the configurations for myHadoop"
+$MH_HOME/bin/myhadoop-configure.sh 
+#
+cp $HIVE_HOME/conf/hive-env.sh-sample $HIVE_CONF_DIR/hive-env.sh
+cp $HIVE_HOME/conf/hive-default.xml-sample $HIVE_CONF_DIR/hive-default.xml
+sed -i 's:MY_HIVE_SCRATCH:'"$SLURMTMPDIR"':g' $HIVE_CONF_DIR/hive-default.xml
+cp $HIVE_HOME/conf/hive-log4j.properties-sample $HIVE_CONF_DIR/hive-log4j.properties
+sed -i 's:MY_HIVE_DIR:'"$SLURM_SUBMIT_DIR"':' $HIVE_CONF_DIR/hive-log4j.properties
+ls -l $HADOOP_CONF_DIR
+echo "-------Start hdfs and yarn ---"
+$HADOOP_HOME/sbin/start-all.sh
+#### Format HDFS, if this is the first time or not a persistent instance
+echo "-------Show Report ---"
+#$HADOOP_HOME/bin/hadoop dfsadmin -report
+echo "-------make directory ---"
+# DON'T CHANGE THSES COMMAND, AS YOU WILL NEED THESE DIRECTORY FOR CREATING TABLE
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir -p /user/hive/warehouse
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /user/hive/warehouse
+#echo "-------list warehouse directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -ls /user/hive/warehouse
+
+
+$HIVE_HOME/bin/hive -e "DROP TABLE if exists fileloader"
+$HIVE_HOME/bin/hive -e "CREATE TABLE fileloader (fulldate date,open float,high float,low float,close float,volume int,adjclose Double) row format delimited fields terminated by ',';"
+echo "Datebase created name: fileloader;" 
+
+$HIVE_HOME/bin/hive -e "LOAD DATA LOCAL INPATH '$1/*.csv' OVERWRITE INTO TABLE fileloader;"
+
+$HIVE_HOME/bin/hive -e "DROP table if exists data;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE data as select split(INPUT__FILE__NAME,'/')[7] AS file,adjclose,YEAR(fulldate) as year,MONTH(fulldate) as month,DAY(fulldate) as day from fileloader;"
+echo "Database created name:data;"
+
+$HIVE_HOME/bin/hive -e "DROP table if exists minmax;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE minmax as select file as filenew, MIN(day) as minn,MAX(day) as maxx, year as yearnew,month as monthnew from data group by file,year,month;"
+
+$HIVE_HOME/bin/hive -e "DROP table if exists min;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE min as select m.filenew as file_min,m.yearnew as year_min,m.monthnew as month_min,m.minn,d.adjclose as adj_min from data d,minmax m where d.file = m.filenew and d.year = m.yearnew and d.month = m.monthnew and d.day = m.minn;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS max;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE max as select m.filenew as file_max,m.yearnew as year_max,m.monthnew as month_max,m.maxx,d.adjclose as adj_max from data d,minmax m where d.file = m.filenew and d.year = m.yearnew and d.month = m.monthnew and d.day = m.maxx;" 
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS intermediate;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE intermediate AS select file_min as fileref,year_min as year,month_min as month,(adj_max-adj_min)/adj_min as monthlyreturn from min mi,max ma where mi.file_min = ma.file_max and mi.year_min = ma.year_max and mi.month_min = ma.month_max;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS intermediate2;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE intermediate2 as select intermediate.fileref as fileref2,AVG(intermediate.monthlyreturn) as avgr from intermediate group by intermediate.fileref;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS vresults;"
+$HIVE_HOME/bin/hive -e "Create TABLE vresults as SELECT inter2.fileref2 as filename,SQRT(SUM(POWER(inter.monthlyreturn - inter2.avgr,2))/(COUNT(*)-1)) as volatility from intermediate inter,intermediate2 inter2 where inter.fileref = inter2.fileref2 GROUP by inter2.fileref2;"
+
+echo "stocks with highest volatility;"
+$HIVE_HOME/bin/hive -e "SELECT filename,volatility from vresults order by volatility desc limit 10;"
+
+echo "stocks with lowest volatility;"
+$HIVE_HOME/bin/hive -e "SELECT filename,volatility from vresults where volatility>0 order by volatility limit 10;"
+
+echo "-------Stop hdfs and yarn ---"
+$HADOOP_HOME/sbin/stop-all.sh
+
+#### Clean up the working directories after job completion
+$MH_HOME/bin/myhadoop-cleanup.sh
+
+
+
+
+
+
